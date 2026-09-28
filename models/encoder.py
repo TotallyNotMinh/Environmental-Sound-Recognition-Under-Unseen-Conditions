@@ -102,6 +102,26 @@ class Block(nn.Module):
         return x
 
 
+def apply_patch_mask(tokens: torch.Tensor, mask_ratio: float = 0.0):
+    """
+    Randomly zero out mask_ratio proportion of patch tokens (SSAST-style).
+    tokens: (B, N, C)
+    """
+    if mask_ratio <= 0.0:
+        return tokens
+    B, N, C = tokens.shape
+    num_mask = int(N * mask_ratio)
+    if num_mask <= 0:
+        return tokens
+
+    rand = torch.rand(B, N, device=tokens.device)
+    mask_idx = torch.argsort(rand, dim=-1)[:, :num_mask]
+
+    mask = torch.ones(B, N, 1, device=tokens.device, dtype=tokens.dtype)
+    mask.scatter_(1, mask_idx.unsqueeze(-1), 0.0)
+    return tokens * mask
+
+
 class DINOVisionTransformer(nn.Module):
     PRETRAINED_URLS = {
         192: "https://dl.fbaipublicfiles.com/deit/deit_tiny_distilled_patch16_224-b40b3cf7.pth",
@@ -230,13 +250,15 @@ class DINOVisionTransformer(nn.Module):
             }.get(self.tok_dim, f"ViT (tok_dim={self.tok_dim})")
             print(f"Successfully loaded and adapted pretrained {arch_name} weights.")
 
-    def forward(self, x):
+    def forward(self, x, mask_ratio: float = 0.0):
         tokens = self.patch_embedder(x)  # (B, N, tok_dim)
         B = tokens.shape[0]
         cls_tokens = self.cls_token.expand(B, -1, -1)
         dist_tokens = self.dist_token.expand(B, -1, -1)
         tokens = torch.cat((cls_tokens, dist_tokens, tokens), dim=1)  # (B, 2 + N, tok_dim)
         tokens = self.pos_drop(tokens)
+        if mask_ratio > 0.0:
+            tokens[:, 2:] = apply_patch_mask(tokens[:, 2:], mask_ratio=mask_ratio)
         for blk in self.blocks:
             tokens = blk(tokens)
         tokens = self.norm(tokens)
@@ -310,10 +332,12 @@ class ASTEncoder(nn.Module):
                 num_layer=num_layer,
             )
 
-    def forward(self, x):
+    def forward(self, x, mask_ratio: float = 0.0):
         if self.use_dino:
-            return self.backbone(x)
+            return self.backbone(x, mask_ratio=mask_ratio)
         tokens = self.patch_embedder(x)
+        if mask_ratio > 0.0:
+            tokens = apply_patch_mask(tokens, mask_ratio=mask_ratio)
         features = self.transformer_encoder(tokens)
         return features
 
