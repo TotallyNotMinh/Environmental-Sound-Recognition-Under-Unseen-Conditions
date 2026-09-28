@@ -18,6 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from models.reconstructer import Reconstructer
 from data.dataset import FSD50KDataset
+from metrics.reconstruction import ReconstructionMetrics
 
 parser = argparse.ArgumentParser(description="Pretrain AST Reconstructer on FSD50K (SSAST-style masked patch reconstruction)")
 parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
@@ -120,12 +121,17 @@ def train():
     # ============== Distributed Setup ==============
     is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if is_distributed:
-        dist.init_process_group(backend="nccl")
+        use_cuda = torch.cuda.is_available()
+        backend = "nccl" if (use_cuda and dist.is_nccl_available()) else "gloo"
+        dist.init_process_group(backend=backend)
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        if use_cuda:
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
     else:
         local_rank = 0
         rank = 0
@@ -234,7 +240,10 @@ def train():
 
     # Wrap model with DistributedDataParallel
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if device.type == "cuda":
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        else:
+            model = DDP(model)
 
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -297,8 +306,7 @@ def train():
 
         # ============== Validation Loop (Rank 0) ==============
         if is_main and (epoch % args.val_interval == 0 or epoch == EPOCHS):
-            running_val_l1 = 0.0
-            running_val_mse = 0.0
+            rec_metrics = ReconstructionMetrics()
 
             raw_model = model.module if hasattr(model, "module") else model
             raw_model.eval()
@@ -315,16 +323,15 @@ def train():
 
                     with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                         pred_clean = raw_model(clean, mask_ratio=args.mask_ratio)
-                        val_l1 = crit_l1(pred_clean, clean)
-                        val_mse = crit_mse(pred_clean, clean)
 
-                    running_val_l1 += val_l1.item()
-                    running_val_mse += val_mse.item()
-                    val_pbar.set_postfix({"val_mae": f"{val_l1.item():.4f}"})
+                    rec_metrics.update(pred_clean, clean)
+                    val_pbar.set_postfix({"val_mae": f"{F.l1_loss(pred_clean, clean).item():.4f}"})
 
-            num_val_batches = max(1, len(val_loader))
-            avg_val_l1 = running_val_l1 / num_val_batches
-            avg_val_mse = running_val_mse / num_val_batches
+            results = rec_metrics.compute()
+            avg_val_l1 = results["mae"]
+            avg_val_mse = results["mse"]
+            val_cos_sim = results["cosine_similarity"]
+            val_ssim = results["ssim"]
 
             current_lr = scheduler.get_last_lr()[0]
             print(
@@ -332,6 +339,8 @@ def train():
                 f"Train L1: {avg_train_loss:.4f} | "
                 f"Val MAE: {avg_val_l1:.4f} | "
                 f"Val MSE: {avg_val_mse:.4f} | "
+                f"Val CosSim: {val_cos_sim:.4f} | "
+                f"Val SSIM: {val_ssim:.4f} | "
                 f"LR: {current_lr:.6f} ==="
             )
 
