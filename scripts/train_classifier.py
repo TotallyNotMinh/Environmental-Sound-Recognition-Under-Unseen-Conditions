@@ -43,6 +43,7 @@ parser.add_argument("--freq-mask", type=int, default=24, help="SpecAugment frequ
 parser.add_argument("--time-mask", type=int, default=48, help="SpecAugment time mask parameter")
 parser.add_argument("--mixup-alpha", type=float, default=0.5, help="Mixup beta distribution alpha parameter")
 parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying Mixup per sample")
+parser.add_argument("--encoder", type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet152", "ast"], help="Backbone architecture")
 
 args = parser.parse_args()
 
@@ -210,6 +211,7 @@ def train():
 
     # ============== Model Initialization ==============
     model = Classifer(
+        encoder_type=args.encoder,
         tok_dim=768,
         num_classes=NUM_CLASSES,
         c_in=1,
