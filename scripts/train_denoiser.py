@@ -86,7 +86,7 @@ def save_checkpoint(checkpoint_dir, checkpoint_name, epoch, model, optimizer, sc
 def load_checkpoint(checkpoint_path, device, model, optimizer, scheduler, scaler):
     if checkpoint_path is None or not os.path.isfile(checkpoint_path):
         print("No checkpoint detected. Starting training from scratch.")
-        return 0, float("inf"), 0
+        return 1, float("inf"), 0
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
@@ -103,7 +103,7 @@ def load_checkpoint(checkpoint_path, device, model, optimizer, scheduler, scaler
     if scaler is not None and "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    start_epoch = checkpoint.get("epoch", -1) + 1
+    start_epoch = checkpoint.get("epoch", 0) + 1
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
