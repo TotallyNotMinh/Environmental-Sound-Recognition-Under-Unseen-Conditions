@@ -47,15 +47,49 @@ class TimeMasking(nn.Module):
         return x
 
 
+class RandomTimeShift(nn.Module):
+    """
+    Random time shift augmentation along time axis.
+    Paper: +/- 10 frames for FSD50K.
+    """
+    def __init__(self, max_shift=10):
+        super().__init__()
+        self.max_shift = max_shift
+
+    def forward(self, x):
+        if self.max_shift <= 0:
+            return x
+        shift = random.randint(-self.max_shift, self.max_shift)
+        if shift == 0:
+            return x
+        return torch.roll(x, shifts=shift, dims=-1)
+
+
+class RandomNoise(nn.Module):
+    """
+    Uniform additive random noise on spectrogram.
+    Paper: U(0, 0.05) on spectrogram for FSD50K.
+    """
+    def __init__(self, max_noise=0.05):
+        super().__init__()
+        self.max_noise = max_noise
+
+    def forward(self, x):
+        if self.max_noise <= 0:
+            return x
+        noise = torch.rand_like(x) * self.max_noise
+        return x + noise
+
+
 class SpecAugment(nn.Module):
     """
     SpecAugment module combining frequency and time masking for audio spectrograms.
-    Can be applied to single spectrograms (C, F, T) or batches (B, C, F, T).
+    Defaults matching AST / CMKD: freq_mask_param=48, time_mask_param=192.
     """
     def __init__(
         self,
-        freq_mask_param=24,
-        time_mask_param=48,
+        freq_mask_param=48,
+        time_mask_param=192,
         num_freq_masks=2,
         num_time_masks=2,
         iid_masks=True,

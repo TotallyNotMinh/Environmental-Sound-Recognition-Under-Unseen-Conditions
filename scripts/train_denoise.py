@@ -39,6 +39,14 @@ parser.add_argument("--freq-mask", type=int, default=24, help="SpecAugment frequ
 parser.add_argument("--time-mask", type=int, default=48, help="SpecAugment time mask parameter")
 parser.add_argument("--mixup-alpha", type=float, default=0.5, help="Mixup alpha parameter")
 parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying Mixup per sample")
+parser.add_argument("--arch", type=str, default="tiny", choices=["tiny", "small", "base"], help="ViT backbone architecture (default: tiny)")
+parser.add_argument("--no-dino", action="store_true", help="Disable pretrained ViT backbone initialization")
+
+ARCH_CONFIGS = {
+    "tiny": {"tok_dim": 192, "num_head": 3, "num_layer": 12, "name": "DeiT ViT-Tiny"},
+    "small": {"tok_dim": 384, "num_head": 6, "num_layer": 12, "name": "DeiT ViT-Small"},
+    "base": {"tok_dim": 768, "num_head": 12, "num_layer": 12, "name": "DeiT ViT-Base"},
+}
 
 args = parser.parse_args()
 
@@ -171,14 +179,16 @@ def train():
 
     # ============== Model & Architecture ==============
     # AST Spectrogram input: (B, 1, 128, 500)
+    arch_cfg = ARCH_CONFIGS[args.arch]
     model = Denoiser(
-        tok_dim=768,
+        tok_dim=arch_cfg["tok_dim"],
         c_in=1,
         overlap=6,
         patch_size=16,
         size=(128, 500),
-        num_head=8,
-        num_layer=12,
+        num_head=arch_cfg["num_head"],
+        num_layer=arch_cfg["num_layer"],
+        pretrained_dino=(not args.no_dino),
     ).to(device)
 
     # ============== Optimizer & Schedulers ==============
@@ -221,6 +231,8 @@ def train():
         print(f"  • Device:                 {device} (world size: {world_size})")
         print(f"  • Total samples:          {len(train_dataset)} train, {len(val_dataset)} val")
         print(f"  • Effective batch size:   {BATCH_SIZE * world_size * args.grad_accum_steps}")
+        print(f"  • Architecture:           ViT-{args.arch.capitalize()} ({arch_cfg['name']})")
+        print(f"  • Pretrained Backbone:    {f"{arch_cfg['name']} (pretrained)" if not args.no_dino else 'Random init'}")
         print(f"  • Learning rates:         Encoder={args.encoder_lr}, Decoder={args.decoder_lr}")
 
     # ============== Training and Validation Loop ==============

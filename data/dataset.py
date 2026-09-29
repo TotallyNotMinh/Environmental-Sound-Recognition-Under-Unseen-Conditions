@@ -9,7 +9,7 @@ import torchaudio
 import torchaudio.functional as AF
 import torchaudio.transforms as T
 
-from data.augment import SpecAugment, mixup_samples
+from data.augment import SpecAugment, mixup_samples, RandomTimeShift, RandomNoise
 
 
 class ACADDataset(Dataset):
@@ -248,22 +248,27 @@ class FSD50KDataset(Dataset):
         root_dir="data/fsd50k",
         split="train",
         sample_rate=16000,
-        duration_sec=5.0,
+        duration_sec=10.0,
         n_mels=128,
         n_fft=1024,
         win_length=400,
         hop_length=160,
-        target_frames=500,
+        target_frames=1000,
         mock=False,
         mock_length=256,
         num_classes=200,
         use_augment=True,
-        freq_mask_param=24,
-        time_mask_param=48,
+        freq_mask_param=48,
+        time_mask_param=192,
         num_freq_masks=2,
         num_time_masks=2,
         mixup_alpha=0.5,
         mixup_prob=0.5,
+        time_shift_param=10,
+        noise_param=0.05,
+        normalize=True,
+        norm_mean=-4.2677393,
+        norm_std=4.5689974,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -278,6 +283,9 @@ class FSD50KDataset(Dataset):
         self.use_augment = use_augment and (self.split == "train")
         self.mixup_alpha = mixup_alpha
         self.mixup_prob = mixup_prob
+        self.normalize = normalize
+        self.norm_mean = norm_mean
+        self.norm_std = norm_std
 
         self.mel_transform = T.MelSpectrogram(
             sample_rate=sample_rate,
@@ -288,6 +296,9 @@ class FSD50KDataset(Dataset):
             center=True,
             power=2.0,
         )
+
+        self.time_shift = RandomTimeShift(max_shift=time_shift_param) if (self.use_augment and time_shift_param > 0) else None
+        self.noise = RandomNoise(max_noise=noise_param) if (self.use_augment and noise_param > 0) else None
 
         self.spec_augment = SpecAugment(
             freq_mask_param=freq_mask_param,
@@ -426,6 +437,9 @@ class FSD50KDataset(Dataset):
         mel = self.mel_transform(waveform)
         log_mel = torch.log(mel.clamp(min=1e-6))
 
+        if self.normalize:
+            log_mel = (log_mel - self.norm_mean) / (self.norm_std * 2.0)
+
         if log_mel.shape[-1] > self.target_frames:
             log_mel = log_mel[..., :self.target_frames]
         elif log_mel.shape[-1] < self.target_frames:
@@ -465,7 +479,7 @@ class FSD50KDataset(Dataset):
     def __getitem__(self, idx):
         mel, target = self._get_raw_item(idx)
 
-        if self.use_augment and self.spec_augment is not None:
+        if self.use_augment:
             total_items = self.mock_length if self.mock else len(self.samples)
             if self.mixup_prob > 0.0 and random.random() < self.mixup_prob and total_items > 1:
                 idx2 = random.randint(0, total_items - 2)
@@ -476,6 +490,40 @@ class FSD50KDataset(Dataset):
                     mel, target, mel2, target2, alpha=self.mixup_alpha
                 )
 
-            mel = self.spec_augment(mel)
+            if self.time_shift is not None:
+                mel = self.time_shift(mel)
+
+            if self.noise is not None:
+                mel = self.noise(mel)
+
+            if self.spec_augment is not None:
+                mel = self.spec_augment(mel)
 
         return mel, target
+
+    def get_sample_weights(self):
+        """
+        Computes inverse class-frequency sample weights for class-balanced sampling.
+        Matches AST and PSLA class balancing on FSD50K.
+        """
+        if self.mock or not self.samples:
+            return torch.ones(len(self), dtype=torch.double)
+
+        class_counts = torch.zeros(self.num_classes, dtype=torch.double)
+        sample_indices_list = []
+        for _, labels in self.samples:
+            idxs = [self.label_to_idx[l] for l in labels if l in self.label_to_idx]
+            for idx in idxs:
+                class_counts[idx] += 1.0
+            sample_indices_list.append(idxs)
+
+        class_weights = 1.0 / torch.clamp(class_counts, min=1.0)
+
+        sample_weights = torch.zeros(len(self.samples), dtype=torch.double)
+        for i, idxs in enumerate(sample_indices_list):
+            if idxs:
+                sample_weights[i] = class_weights[idxs].sum()
+            else:
+                sample_weights[i] = 1.0
+
+        return sample_weights

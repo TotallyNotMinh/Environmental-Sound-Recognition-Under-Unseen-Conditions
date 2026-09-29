@@ -45,6 +45,8 @@ class DenoisingDecoder(nn.Module):
 
     def forward(self, features: torch.Tensor):
         B = features.shape[0]
+        if features.shape[1] == self.H_patch * self.W_patch + 2:
+            features = features[:, 2:]
         features = features.transpose(1, 2).view((B, self.tok_dim, self.H_patch, self.W_patch))
 
         dec1 = self.dec1(features)
