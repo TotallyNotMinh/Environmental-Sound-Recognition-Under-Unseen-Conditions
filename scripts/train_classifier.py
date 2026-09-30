@@ -19,13 +19,13 @@ from torch.utils.data.distributed import DistributedSampler
 # Direct import as requested: user will implement/customize Classifer in models
 from models import Classifer
 from data.dataset import FSD50KDataset
-from data.sampler import DistributedWeightedSampler
 from metrics.classification import MultiLabelClassificationMetrics
 
 parser = argparse.ArgumentParser(description="Train AST Classifier on FSD50K multi-label sound events")
-parser.add_argument("--batch-size", type=int, default=12, help="Batch size per GPU (AST default: 12)")
-parser.add_argument("--duration-sec", type=float, default=10.0, help="Audio clip duration in seconds (AST default: 10.0)")
-parser.add_argument("--target-frames", type=int, default=1000, help="Target spectrogram frames (AST default: 1000)")
+parser.add_argument("--pooling", type=str, default=None,
+                    choices=[None, "gap", "gap_max", "attention"],
+                    help="None = baseline dual-token pooling; else ablation variant")
+parser.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU")
 parser.add_argument("--checkpoint-path", type=str, default=None, help="Resume training checkpoint")
 parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/fsd50k/", help="Directory to save checkpoints")
 parser.add_argument("--pretrained-encoder", type=str, default=None, help="Path to pretrained denoiser/encoder weights")
@@ -33,27 +33,21 @@ parser.add_argument("--freeze-encoder", action="store_true", help="Freeze encode
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
 parser.add_argument("--data-path", type=str, default="data/fsd50k", help="Path to FSD50K dataset root")
-parser.add_argument("--num-epoch", type=int, default=30, help="Number of training epochs (FSD50K default: 50)")
-parser.add_argument("--encoder-lr", type=float, default=5e-5, help="Backbone encoder learning rate (AST default: 5e-5)")
-parser.add_argument("--head-lr", type=float, default=5e-5, help="Classifier head learning rate (AST default: 5e-5)")
-parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay")
+parser.add_argument("--num-epoch", type=int, default=50, help="Number of training epochs")
+parser.add_argument("--encoder-lr", type=float, default=2e-5, help="Backbone encoder learning rate")
+parser.add_argument("--head-lr", type=float, default=2e-4, help="Classifier head learning rate")
+parser.add_argument("--weight-decay", type=float, default=1e-3, help="Weight decay")
 parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers per GPU")
 parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
 parser.add_argument("--val-interval", type=int, default=1, help="Validation frequency (in epochs)")
 parser.add_argument("--mock", action="store_true", help="Use synthetic mock data for testing/benchmarking")
-parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation (SpecAugment, Mixup, TimeShift, Noise)")
-parser.add_argument("--freq-mask", type=int, default=48, help="SpecAugment frequency mask parameter (AST default: 48)")
-parser.add_argument("--time-mask", type=int, default=192, help="SpecAugment time mask parameter (AST default: 192)")
-parser.add_argument("--time-shift", type=int, default=10, help="Random time shift in frames (CMKD default: 10)")
-parser.add_argument("--noise-level", type=float, default=0.05, help="Spectrogram uniform noise level (CMKD default: 0.05)")
-parser.add_argument("--label-smoothing", type=float, default=0.1, help="BCE label smoothing factor (CMKD default: 0.1)")
-parser.add_argument("--no-class-balancing", action="store_true", help="Disable class-balanced sampling")
+parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation (SpecAugment and Mixup)")
+parser.add_argument("--freq-mask", type=int, default=24, help="SpecAugment frequency mask parameter")
+parser.add_argument("--time-mask", type=int, default=48, help="SpecAugment time mask parameter")
 parser.add_argument("--mixup-alpha", type=float, default=0.5, help="Mixup beta distribution alpha parameter")
 parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying Mixup per sample")
 parser.add_argument("--arch", type=str, default="tiny", choices=["tiny", "small", "base"], help="ViT backbone architecture (default: tiny)")
 parser.add_argument("--no-dino", action="store_true", help="Disable pretrained ViT backbone initialization")
-parser.add_argument("--no-cls-dist", action="store_true", help="Disable CLS+DIST dual token pooling (fall back to mean pooling)")
-parser.add_argument("--lr-scheduler", type=str, default="ast_step", choices=["ast_step", "cosine"], help="LR scheduler: ast_step (decay 0.90 after epoch 5) or cosine")
 
 ARCH_CONFIGS = {
     "tiny": {"tok_dim": 192, "num_head": 3, "num_layer": 12, "name": "DeiT ViT-Tiny"},
@@ -78,14 +72,12 @@ def seed_worker(worker_id):
 
 
 def load_pretrained_encoder_weights(model, pretrained_path, device, arch_name="ViT", is_main=True):
-    """
-    Extracts and loads pretrained ASTEncoder weights from a Denoiser pretraining checkpoint
-    or an earlier AST checkpoint, cleanly discarding unused decoder/head parameters.
-    """
+
     if pretrained_path is None or not os.path.isfile(pretrained_path):
         if is_main:
             raw_model = model.module if hasattr(model, "module") else model
             has_dino = getattr(raw_model.encoder, "use_dino", False) if hasattr(raw_model, "encoder") else False
+
             if has_dino:
                 print(f"No custom checkpoint specified; using pretrained {arch_name} encoder.")
             else:
@@ -95,29 +87,38 @@ def load_pretrained_encoder_weights(model, pretrained_path, device, arch_name="V
     checkpoint = torch.load(pretrained_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
 
-    # Clean DDP module. prefix
+    # Clean DDP "module." prefix
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
     raw_model = model.module if hasattr(model, "module") else model
-    encoder_module = raw_model.encoder if hasattr(raw_model, "encoder") else raw_model
+    encoder_module = raw_model.encoder
 
     encoder_state = encoder_module.state_dict()
-    extracted_weights = {}
 
-    for k, v in state_dict.items():
-        if k.startswith("encoder."):
-            clean_k = k[len("encoder."):]
-            if clean_k in encoder_state and encoder_state[clean_k].shape == v.shape:
-                extracted_weights[clean_k] = v
-        elif k in encoder_state and encoder_state[k].shape == v.shape:
-            extracted_weights[k] = v
+    # Extract only encoder weights
+    extracted_weights = {
+        k.replace("encoder.", "", 1): v
+        for k, v in state_dict.items()
+        if k.startswith("encoder.")
+        and k.replace("encoder.", "", 1) in encoder_state
+    }
 
-    missing, unexpected = encoder_module.load_state_dict(extracted_weights, strict=False)
+    missing, unexpected = encoder_module.load_state_dict(
+        extracted_weights,
+        strict=False
+    )
+
     if is_main:
         print(f"Successfully warm-started ASTEncoder from: {pretrained_path}")
         print(f"  • Loaded {len(extracted_weights)}/{len(encoder_state)} encoder layers.")
+
         if missing:
             print(f"  • Missing layers (kept initialized): {len(missing)}")
+
+    if len(extracted_weights) != len(encoder_state):
+        raise RuntimeError(
+            f"Encoder only loaded {len(extracted_weights)}/{len(encoder_state)} layers — aborting."
+        )
 
 
 def save_checkpoint(checkpoint_dir, checkpoint_name, epoch, model, optimizer, scheduler, best_map, epochs_without_improvement, scaler):
@@ -141,7 +142,7 @@ def save_checkpoint(checkpoint_dir, checkpoint_name, epoch, model, optimizer, sc
 
 def load_resume_checkpoint(checkpoint_path, device, model, optimizer, scheduler, scaler):
     if checkpoint_path is None or not os.path.isfile(checkpoint_path):
-        return 1, 0.0, 0
+        return 0, 0.0, 0
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
@@ -157,7 +158,7 @@ def load_resume_checkpoint(checkpoint_path, device, model, optimizer, scheduler,
     if scaler is not None and "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    start_epoch = checkpoint.get("epoch", 0) + 1
+    start_epoch = checkpoint.get("epoch", -1) + 1
     best_map = checkpoint.get("best_map", 0.0)
     epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
@@ -198,50 +199,17 @@ def train():
     train_dataset = FSD50KDataset(
         root_dir=args.data_path,
         split="train",
-        duration_sec=args.duration_sec,
-        target_frames=args.target_frames,
         mock=args.mock,
         num_classes=NUM_CLASSES,
         use_augment=not args.no_augment,
         freq_mask_param=args.freq_mask,
         time_mask_param=args.time_mask,
-        time_shift_param=args.time_shift,
-        noise_param=args.noise_level,
         mixup_alpha=args.mixup_alpha,
         mixup_prob=args.mixup_prob,
-        normalize=True,
     )
-    val_dataset = FSD50KDataset(
-        root_dir=args.data_path,
-        split="val",
-        duration_sec=args.duration_sec,
-        target_frames=args.target_frames,
-        mock=args.mock,
-        num_classes=NUM_CLASSES,
-        normalize=True,
-    )
+    val_dataset = FSD50KDataset(root_dir=args.data_path, split="val", mock=args.mock, num_classes=NUM_CLASSES)
 
-    if not args.no_class_balancing and not args.mock:
-        sample_weights = train_dataset.get_sample_weights()
-        if is_distributed:
-            train_sampler = DistributedWeightedSampler(
-                dataset=train_dataset,
-                weights=sample_weights,
-                num_replicas=world_size,
-                rank=rank,
-                replacement=True,
-                seed=args.seed,
-            )
-        else:
-            train_sampler = torch.utils.data.WeightedRandomSampler(
-                weights=sample_weights,
-                num_samples=len(sample_weights),
-                replacement=True,
-            )
-    elif is_distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-    else:
-        train_sampler = None
+    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False) if is_distributed else None
 
     train_loader = DataLoader(
         train_dataset,
@@ -271,11 +239,11 @@ def train():
         c_in=1,
         overlap=6,
         patch_size=16,
-        size=(128, args.target_frames),
+        size=(128, 1000),
         num_head=arch_cfg["num_head"],
         num_layer=arch_cfg["num_layer"],
         pretrained_dino=(not args.no_dino and args.pretrained_encoder is None),
-        use_cls_dist=not args.no_cls_dist,
+        pooling=args.pooling,
     ).to(device)
 
     # Load pretrained encoder weights if supplied
@@ -286,8 +254,11 @@ def train():
     if args.freeze_encoder and hasattr(raw_model, "encoder"):
         for param in raw_model.encoder.parameters():
             param.requires_grad = False
+        raw_model.freeze_encoder = True
         if is_main:
             print("Frozen ASTEncoder backbone for linear probing evaluation.")
+            n_train = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+            print(f"Trainable params: {n_train}")
 
     # ============== Optimizer & Schedulers ==============
     if hasattr(raw_model, "encoder") and not args.freeze_encoder:
@@ -303,25 +274,16 @@ def train():
 
     optimizer = torch.optim.AdamW(param_groups)
 
-    if args.lr_scheduler == "ast_step":
-        # AST schedule: keep initial LR for 5 epochs, then decay by 0.90 every epoch
-        def ast_lr_lambda(ep):
-            if ep < 5:
-                return 1.0
-            return 0.90 ** (ep - 4)
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=ast_lr_lambda)
-    else:
-        warmup_epochs = min(5, max(1, EPOCHS // 10))
-        linear_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
-        )
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, EPOCHS - warmup_epochs), eta_min=1e-6
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[linear_scheduler, cosine_scheduler], milestones=[warmup_epochs]
-        )
+    warmup_epochs = min(5, max(1, EPOCHS // 10))
+    linear_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, EPOCHS - warmup_epochs), eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[linear_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+    )
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
@@ -347,24 +309,10 @@ def train():
         print(f"  • Architecture:           ViT-{args.arch.capitalize()} ({arch_cfg['name']})")
         print(f"  • Pretrained Backbone:    {backbone_desc}")
         print(f"  • Encoder Frozen:         {args.freeze_encoder}")
-        sampler_desc = (
-            "Class-Balanced (DistributedWeightedSampler)"
-            if (not args.no_class_balancing and not args.mock and is_distributed)
-            else (
-                "Class-Balanced (WeightedRandomSampler)"
-                if (not args.no_class_balancing and not args.mock)
-                else (
-                    "Standard DistributedSampler"
-                    if is_distributed
-                    else "Standard Uniform"
-                )
-            )
-        )
-        print(f"  • Sampling:               {sampler_desc}")
 
     # ============== Training and Validation Loop ==============
     for epoch in range(start_epoch, EPOCHS + 1):
-        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+        if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         model.train(True)
@@ -384,11 +332,7 @@ def train():
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(spectrograms)
-                if args.label_smoothing > 0.0:
-                    smoothed_targets = targets * (1.0 - args.label_smoothing) + 0.5 * args.label_smoothing
-                    loss = criterion(logits, smoothed_targets)
-                else:
-                    loss = criterion(logits, targets)
+                loss = criterion(logits, targets)
                 loss_to_backward = loss / accum_steps
 
             scaler.scale(loss_to_backward).backward()
