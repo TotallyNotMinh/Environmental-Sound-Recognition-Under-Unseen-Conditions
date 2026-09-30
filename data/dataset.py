@@ -11,6 +11,7 @@ import torchaudio.transforms as T
 
 from data.augment import SpecAugment, mixup_samples, RandomTimeShift, RandomNoise
 
+
 class FSD50KDataset(Dataset):
     """
     Dataset for FSD50K multi-label sound event classification.
@@ -45,12 +46,16 @@ class FSD50KDataset(Dataset):
         num_time_masks=2,
         mixup_alpha=0.5,
         mixup_prob=0.5,
+        mixup_mode="union",
         time_shift_param=10,
         noise_param=0.05,
         normalize=True,
         norm_mean=-4.2677393,
         norm_std=4.5689974,
         return_labels=True,
+        noise_dir=None,
+        min_snr=0.0,
+        max_snr=20.0,
     ):
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -66,9 +71,24 @@ class FSD50KDataset(Dataset):
         self.use_augment = use_augment and (self.split == "train")
         self.mixup_alpha = mixup_alpha
         self.mixup_prob = mixup_prob
+        self.mixup_mode = mixup_mode
         self.normalize = normalize
         self.norm_mean = norm_mean
         self.norm_std = norm_std
+
+        self.noise_bank = None
+        if noise_dir is not None and (self.split == "train" or not return_labels):
+            if not mock:
+                from data.noise import RealWorldNoiseBank
+                self.noise_bank = RealWorldNoiseBank(
+                    noise_dir=noise_dir,
+                    target_sample_rate=self.sample_rate,
+                    bank_size=1000,
+                )
+            else:
+                self.noise_bank = "mock_bank"
+        self.min_snr = min_snr
+        self.max_snr = max_snr
 
         self.mel_transform = T.MelSpectrogram(
             sample_rate=sample_rate,
@@ -194,7 +214,7 @@ class FSD50KDataset(Dataset):
 
         return samples
 
-    def _load_and_crop_audio(self, file_path):
+    def _load_cropped_waveform(self, file_path):
         waveform, sr = torchaudio.load(file_path)
 
         if waveform.ndim == 2 and waveform.shape[0] > 1:
@@ -217,6 +237,9 @@ class FSD50KDataset(Dataset):
             pad = self.target_len - length
             waveform = F.pad(waveform, (0, pad))
 
+        return waveform
+
+    def _waveform_to_mel(self, waveform):
         mel = self.mel_transform(waveform)
         log_mel = torch.log(mel.clamp(min=1e-6))
 
@@ -230,6 +253,10 @@ class FSD50KDataset(Dataset):
 
         return log_mel
 
+    def _load_and_crop_audio(self, file_path):
+        waveform = self._load_cropped_waveform(file_path)
+        return self._waveform_to_mel(waveform)
+
     def __len__(self):
         if self.mock:
             return self.mock_length
@@ -241,6 +268,9 @@ class FSD50KDataset(Dataset):
             target = torch.zeros(self.num_classes, dtype=torch.float32)
             active_classes = torch.randint(0, self.num_classes, (random.randint(1, 3),))
             target[active_classes] = 1.0
+            if self.noise_bank is not None:
+                mel_noisy = torch.randn(1, 128, self.target_frames)
+                return mel, mel_noisy, target
             return mel, target
 
         if not self.samples:
@@ -250,17 +280,32 @@ class FSD50KDataset(Dataset):
             )
 
         audio_path, labels = self.samples[idx]
-        mel = self._load_and_crop_audio(audio_path)
+        waveform = self._load_cropped_waveform(audio_path)
+        mel_clean = self._waveform_to_mel(waveform)
+
+        if self.noise_bank is not None:
+            noisy_wave = self.noise_bank.mix(waveform, snr_range=(self.min_snr, self.max_snr))
+            mel_noisy = self._waveform_to_mel(noisy_wave)
+        else:
+            mel_noisy = None
 
         target = torch.zeros(self.num_classes, dtype=torch.float32)
         for label in labels:
             if label in self.label_to_idx:
                 target[self.label_to_idx[label]] = 1.0
 
-        return mel, target
+        if mel_noisy is not None:
+            return mel_clean, mel_noisy, target
+        return mel_clean, target
 
     def __getitem__(self, idx):
-        mel, target = self._get_raw_item(idx)
+        item = self._get_raw_item(idx)
+        has_noise = (len(item) == 3)
+        if has_noise:
+            mel, mel_noisy, target = item
+        else:
+            mel, target = item
+            mel_noisy = None
 
         if self.use_augment:
             total_items = self.mock_length if self.mock else len(self.samples)
@@ -268,23 +313,37 @@ class FSD50KDataset(Dataset):
                 idx2 = random.randint(0, total_items - 2)
                 if idx2 >= idx:
                     idx2 += 1
-                mel2, target2 = self._get_raw_item(idx2)
-                mel, target = mixup_samples(
-                    mel, target, mel2, target2, alpha=self.mixup_alpha
+                item2 = self._get_raw_item(idx2)
+                mel2 = item2[0]
+                target2 = item2[-1]
+                target_orig = target
+                mel, target, lam = mixup_samples(
+                    mel, target_orig, mel2, target2, alpha=self.mixup_alpha, label_mode=self.mixup_mode, return_lam=True
                 )
+                if has_noise:
+                    mel2_noisy = item2[1]
+                    mel_noisy, _ = mixup_samples(
+                        mel_noisy, target_orig, mel2_noisy, target2, alpha=self.mixup_alpha, label_mode=self.mixup_mode, lam=lam, return_lam=False
+                    )
 
             if self.time_shift is not None:
                 mel = self.time_shift(mel)
+                if mel_noisy is not None:
+                    mel_noisy = self.time_shift(mel_noisy)
 
-            if self.noise is not None:
+            if self.noise is not None and mel_noisy is None:
                 mel = self.noise(mel)
 
             if self.spec_augment is not None:
                 mel = self.spec_augment(mel)
+                if mel_noisy is not None:
+                    mel_noisy = self.spec_augment(mel_noisy)
 
         if not self.return_labels:
-            return mel, mel
+            return (mel_noisy, mel) if has_noise else (mel, mel)
 
+        if has_noise:
+            return mel, mel_noisy, target
         return mel, target
 
     def get_sample_weights(self):

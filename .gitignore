@@ -5,4 +5,5 @@
 !/data/dataset.py
 !/data/augment.py
 !/data/sampler.py
+!/data/noise.py
 /checkpoints/
