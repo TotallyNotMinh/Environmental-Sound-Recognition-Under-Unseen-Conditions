@@ -7,7 +7,7 @@ try:
     from torchinfo import summary
 except ImportError:
     summary = None
-
+from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0
 
 class PatchEmbedder(nn.Module):
     def __init__(self, tok_dim=768, c_in=1, overlap=6, patch_size=16, size=(128, 1000)):
@@ -341,11 +341,27 @@ class ASTEncoder(nn.Module):
         features = self.transformer_encoder(tokens)
         return features
 
+class EfficientNetEncoder(nn.Module):
+    def  __init__(self, patch_size=16, overlap=10, tok_dim=192, size=(128, 1000)):
+        super().__init__()
+        weights = EfficientNet_B0_Weights.DEFAULT
+        backbone = efficientnet_b0(weights=weights)
+        self.features = backbone.features
+        (H, W) = size
 
+        self.stride = patch_size - overlap
+        self.H_out = (H - patch_size) // self.stride + 1
+        self.W_out = (W - patch_size) // self.stride + 1
+
+    def forward(self, x:torch.Tensor):
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        return self.features(x)
+    
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = torch.rand([1, 1, 128, 500], device=device)
-    model = ASTEncoder(pretrained_dino=True).to(device=device)
+    x = torch.rand([1, 1, 128, 1000], device=device)
+    model = EfficientNetEncoder().to(device=device)
     out = model(x)
     print("Output shape:", out.shape)
     summary(model, input_size=(1, 1, 128, 500))
