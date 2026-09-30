@@ -306,6 +306,7 @@ class ASTEncoder(nn.Module):
     ):
         super().__init__()
         self.use_dino = use_dino
+        self.has_cls_dist = use_dino
         if use_dino:
             self.backbone = DINOVisionTransformer(
                 tok_dim=tok_dim,
@@ -342,13 +343,14 @@ class ASTEncoder(nn.Module):
         return features
 
 class EfficientNetEncoder(nn.Module):
-    def  __init__(self):
+    def __init__(self, pretrained: bool = True):
         super().__init__()
-        weights = EfficientNet_B0_Weights.DEFAULT
+        weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
         backbone = efficientnet_b0(weights=weights)
         self.features = backbone.features
+        self.out_dim = 1280
 
-    def forward(self, x:torch.Tensor):
+    def forward(self, x: torch.Tensor):
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
         return self.features(x)
