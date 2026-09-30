@@ -50,9 +50,15 @@ parser.add_argument("--label-smoothing", type=float, default=0.1, help="BCE labe
 parser.add_argument("--no-class-balancing", action="store_true", help="Disable class-balanced sampling")
 parser.add_argument("--mixup-alpha", type=float, default=0.5, help="Mixup beta distribution alpha parameter")
 parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying Mixup per sample")
+parser.add_argument("--mixup-mode", type=str, default="union", choices=["union", "linear"], help="Multi-label mixup target strategy: union (max(y1, y2)) or linear (lam*y1 + (1-lam)*y2)")
+parser.add_argument("--encoder", type=str, default="ast", choices=["ast", "efficientnet"], help="Encoder architecture family: ast (Vision Transformer) or efficientnet (EfficientNet-B0)")
 parser.add_argument("--arch", type=str, default="tiny", choices=["tiny", "small", "base"], help="ViT backbone architecture (default: tiny)")
-parser.add_argument("--no-dino", action="store_true", help="Disable pretrained ViT backbone initialization")
+parser.add_argument("--no-dino", action="store_true", help="Disable pretrained backbone initialization")
 parser.add_argument("--no-cls-dist", action="store_true", help="Disable CLS+DIST dual token pooling (fall back to mean pooling)")
+parser.add_argument("--noise-path", type=str, default=None, help="Path to real-world noise directory (e.g. TAU Urban Acoustic Scenes) for feature consistency training")
+parser.add_argument("--consistency-weight", type=float, default=1.0, help="Weight gamma for feature consistency loss (default: 1.0)")
+parser.add_argument("--min-snr", type=float, default=0.0, help="Minimum SNR in dB for noise mixing (default: 0.0)")
+parser.add_argument("--max-snr", type=float, default=20.0, help="Maximum SNR in dB for noise mixing (default: 20.0)")
 parser.add_argument("--lr-scheduler", type=str, default="ast_step", choices=["ast_step", "cosine"], help="LR scheduler: ast_step (decay 0.90 after epoch 5) or cosine")
 
 ARCH_CONFIGS = {
@@ -210,6 +216,9 @@ def train():
         mixup_alpha=args.mixup_alpha,
         mixup_prob=args.mixup_prob,
         normalize=True,
+        noise_dir=args.noise_path,
+        min_snr=args.min_snr,
+        max_snr=args.max_snr,
     )
     val_dataset = FSD50KDataset(
         root_dir=args.data_path,
@@ -266,6 +275,7 @@ def train():
     # ============== Model Initialization ==============
     arch_cfg = ARCH_CONFIGS[args.arch]
     model = Classifer(
+        encoder_type=args.encoder,
         tok_dim=arch_cfg["tok_dim"],
         num_classes=NUM_CLASSES,
         c_in=1,
@@ -279,7 +289,15 @@ def train():
     ).to(device)
 
     # Load pretrained encoder weights if supplied
-    load_pretrained_encoder_weights(model, args.pretrained_encoder, device, arch_name=arch_cfg["name"], is_main=is_main)
+    if args.encoder == "ast":
+        load_pretrained_encoder_weights(model, args.pretrained_encoder, device, arch_name=arch_cfg["name"], is_main=is_main)
+    elif args.pretrained_encoder is not None:
+        load_pretrained_encoder_weights(model, args.pretrained_encoder, device, arch_name="EfficientNet-B0", is_main=is_main)
+    elif is_main:
+        if not args.no_dino:
+            print("Using pretrained EfficientNet-B0 backbone (ImageNet default).")
+        else:
+            print("Training EfficientNet-B0 backbone from random initialization.")
 
     # Freeze encoder parameters if linear probe requested
     raw_model = model.module if hasattr(model, "module") else model
@@ -287,7 +305,7 @@ def train():
         for param in raw_model.encoder.parameters():
             param.requires_grad = False
         if is_main:
-            print("Frozen ASTEncoder backbone for linear probing evaluation.")
+            print(f"Frozen {args.encoder.upper()} encoder backbone for linear probing evaluation.")
 
     # ============== Optimizer & Schedulers ==============
     if hasattr(raw_model, "encoder") and not args.freeze_encoder:
@@ -334,7 +352,7 @@ def train():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
 
     metrics = MultiLabelClassificationMetrics(num_classes=NUM_CLASSES)
 
@@ -343,8 +361,14 @@ def train():
         print(f"  • Device:                 {device} (world size: {world_size})")
         print(f"  • Total samples:          {len(train_dataset)} train, {len(val_dataset)} val")
         print(f"  • Effective batch size:   {BATCH_SIZE * world_size * args.grad_accum_steps}")
-        backbone_desc = args.pretrained_encoder if args.pretrained_encoder else (f"{arch_cfg['name']} (pretrained)" if not args.no_dino else "Random init")
-        print(f"  • Architecture:           ViT-{args.arch.capitalize()} ({arch_cfg['name']})")
+        if args.encoder == "efficientnet":
+            arch_desc = "EfficientNet-B0 (1280 dim)"
+            backbone_desc = args.pretrained_encoder if args.pretrained_encoder else ("EfficientNet-B0 (ImageNet pretrained)" if not args.no_dino else "Random init")
+        else:
+            arch_desc = f"ViT-{args.arch.capitalize()} ({arch_cfg['name']})"
+            backbone_desc = args.pretrained_encoder if args.pretrained_encoder else (f"{arch_cfg['name']} (pretrained)" if not args.no_dino else "Random init")
+        print(f"  • Encoder Family:         {args.encoder.upper()}")
+        print(f"  • Architecture:           {arch_desc}")
         print(f"  • Pretrained Backbone:    {backbone_desc}")
         print(f"  • Encoder Frozen:         {args.freeze_encoder}")
         sampler_desc = (
@@ -361,6 +385,11 @@ def train():
             )
         )
         print(f"  • Sampling:               {sampler_desc}")
+        if args.noise_path:
+            print(f"  • Feature Consistency:   Active (weight: {args.consistency_weight}, SNR: [{args.min_snr}, {args.max_snr}] dB)")
+            print(f"  • Noise Bank Source:     {args.noise_path}")
+        else:
+            print(f"  • Feature Consistency:   Disabled")
 
     # ============== Training and Validation Loop ==============
     for epoch in range(start_epoch, EPOCHS + 1):
@@ -369,6 +398,8 @@ def train():
 
         model.train(True)
         running_train_loss = 0.0
+        running_cls_loss = 0.0
+        running_cst_loss = 0.0
         accum_steps = args.grad_accum_steps
         optimizer.zero_grad(set_to_none=True)
 
@@ -378,17 +409,49 @@ def train():
             leave=False,
             disable=not is_main,
         )
-        for batch_idx, (spectrograms, targets) in enumerate(train_pbar):
-            spectrograms = spectrograms.to(device, non_blocking=True)
+        for batch_idx, batch in enumerate(train_pbar):
+            if len(batch) == 3:
+                clean_specs, noisy_specs, targets = batch
+                has_noise = True
+                noisy_specs = noisy_specs.to(device, non_blocking=True)
+            else:
+                clean_specs, targets = batch
+                noisy_specs = None
+                has_noise = False
+
+            clean_specs = clean_specs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                logits = model(spectrograms)
-                if args.label_smoothing > 0.0:
-                    smoothed_targets = targets * (1.0 - args.label_smoothing) + 0.5 * args.label_smoothing
-                    loss = criterion(logits, smoothed_targets)
+                if has_noise and args.consistency_weight > 0.0:
+                    bsz = clean_specs.size(0)
+                    both_specs = torch.cat([clean_specs, noisy_specs], dim=0)
+                    both_logits, both_feats = model(both_specs, return_features=True)
+                    logits = both_logits[:bsz]
+                    clean_feats = both_feats[:bsz]
+                    noisy_feats = both_feats[bsz:]
+
+                    if args.label_smoothing > 0.0:
+                        smoothed_targets = targets * (1.0 - args.label_smoothing) + 0.5 * args.label_smoothing
+                        cls_loss = criterion(logits, smoothed_targets)
+                    else:
+                        cls_loss = criterion(logits, targets)
+
+                    # Cosine Distance loss: 1.0 - cosine_similarity
+                    sim = F.cosine_similarity(clean_feats, noisy_feats, dim=-1)
+                    consistency_loss = (1.0 - sim).mean()
+
+                    loss = cls_loss + args.consistency_weight * consistency_loss
                 else:
-                    loss = criterion(logits, targets)
+                    logits = model(clean_specs)
+                    if args.label_smoothing > 0.0:
+                        smoothed_targets = targets * (1.0 - args.label_smoothing) + 0.5 * args.label_smoothing
+                        cls_loss = criterion(logits, smoothed_targets)
+                    else:
+                        cls_loss = criterion(logits, targets)
+                    consistency_loss = torch.tensor(0.0, device=device)
+                    loss = cls_loss
+
                 loss_to_backward = loss / accum_steps
 
             scaler.scale(loss_to_backward).backward()
@@ -401,16 +464,28 @@ def train():
                 optimizer.zero_grad(set_to_none=True)
 
             running_train_loss += loss.item()
+            running_cls_loss += cls_loss.item()
+            running_cst_loss += consistency_loss.item()
+
             if is_main:
-                train_pbar.set_postfix({"bce": f"{loss.item():.4f}"})
+                if has_noise and args.consistency_weight > 0.0:
+                    train_pbar.set_postfix({"bce": f"{cls_loss.item():.4f}", "cst": f"{consistency_loss.item():.4f}"})
+                else:
+                    train_pbar.set_postfix({"bce": f"{loss.item():.4f}"})
 
         scheduler.step()
-        avg_train_loss = running_train_loss / max(1, len(train_loader))
+        num_batches = max(1, len(train_loader))
+        avg_train_loss = running_train_loss / num_batches
+        avg_cls_loss = running_cls_loss / num_batches
+        avg_cst_loss = running_cst_loss / num_batches
 
         if is_distributed:
-            loss_tensor = torch.tensor([avg_train_loss], device=device)
+            loss_tensor = torch.tensor([avg_train_loss, avg_cls_loss, avg_cst_loss], device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            avg_train_loss = (loss_tensor / world_size).item()
+            loss_tensor = loss_tensor / world_size
+            avg_train_loss = loss_tensor[0].item()
+            avg_cls_loss = loss_tensor[1].item()
+            avg_cst_loss = loss_tensor[2].item()
 
         # ============== Validation Loop (Rank 0) ==============
         if is_main and (epoch % args.val_interval == 0 or epoch == EPOCHS):
@@ -449,9 +524,13 @@ def train():
             top5_hit = val_results["top5_hit"]
 
             current_lr = scheduler.get_last_lr()[0]
+            if args.noise_path and args.consistency_weight > 0.0:
+                loss_info = f"Train Loss: {avg_train_loss:.4f} (BCE: {avg_cls_loss:.4f}, CST: {avg_cst_loss:.4f})"
+            else:
+                loss_info = f"Train BCE: {avg_train_loss:.4f}"
             print(
                 f"=== Epoch [{epoch:02d}/{EPOCHS:02d}] | "
-                f"Train BCE: {avg_train_loss:.4f} | "
+                f"{loss_info} | "
                 f"Val BCE: {avg_val_loss:.4f} | "
                 f"mAP: {val_map:.4f} | "
                 f"mAUC: {val_mauc:.4f} | "
