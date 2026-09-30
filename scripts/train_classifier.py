@@ -167,20 +167,42 @@ def load_resume_checkpoint(checkpoint_path, device, model, optimizer, scheduler,
 
 
 def train():
+    # ============== GPU Diagnostics ==============
+    print(f"[DIAG] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    print(f"[DIAG] torch.cuda.device_count() = {torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            print(f"[DIAG] GPU {i}: {torch.cuda.get_device_name(i)}")
+
     # ============== Distributed Setup ==============
     is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if is_distributed:
-        dist.init_process_group(backend="nccl")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        try:
+            dist.init_process_group(backend="nccl")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+            print(f"[DIAG] Distributed init OK: rank={rank}, world_size={world_size}, device={device}")
+        except Exception as e:
+            print(f"[WARN] Distributed init failed: {e}")
+            print(f"[WARN] Falling back to single-GPU mode.")
+            is_distributed = False
+            local_rank = 0
+            rank = 0
+            world_size = 1
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         local_rank = 0
         rank = 0
         world_size = 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[DIAG] Final device: {device}")
+    if device.type != "cuda":
+        print("[ERROR] CUDA is NOT available! Training will be extremely slow on CPU.")
+        print("[ERROR] On Kaggle: Settings → Accelerator → select GPU T4 x2 or P100.")
 
     is_main = (rank == 0)
     set_seed(args.seed + rank)
