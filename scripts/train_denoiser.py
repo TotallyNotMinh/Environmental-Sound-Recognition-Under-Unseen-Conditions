@@ -17,15 +17,18 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from models.denoiser import Denoiser
-from data.dataset import ACADDataset
+from data.dataset import FSD50KDataset
 
-parser = argparse.ArgumentParser(description="Pretrain AST Denoiser on ACAD dataset")
+parser = argparse.ArgumentParser(description="Pretrain Audio Denoiser on FSD50K dataset")
 parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU")
 parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to resume training checkpoint")
 parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/", help="Directory to save checkpoints")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-parser.add_argument("--data-path", type=str, default="data/acad", help="Path to ACAD dataset directory")
+parser.add_argument("--data-path", type=str, default="data/fsd50k", help="Path to FSD50K dataset directory")
+parser.add_argument("--noise-path", type=str, default=None, help="Path to real-world noise directory (e.g. TAU Urban Acoustic Scenes)")
+parser.add_argument("--min-snr", type=float, default=0.0, help="Minimum SNR in dB for noise mixing")
+parser.add_argument("--max-snr", type=float, default=20.0, help="Maximum SNR in dB for noise mixing")
 parser.add_argument("--num-epoch", type=int, default=100, help="Number of training epochs")
 parser.add_argument("--encoder-lr", type=float, default=1e-4, help="Encoder learning rate")
 parser.add_argument("--decoder-lr", type=float, default=2e-4, help="Decoder learning rate")
@@ -39,14 +42,6 @@ parser.add_argument("--freq-mask", type=int, default=24, help="SpecAugment frequ
 parser.add_argument("--time-mask", type=int, default=48, help="SpecAugment time mask parameter")
 parser.add_argument("--mixup-alpha", type=float, default=0.5, help="Mixup alpha parameter")
 parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying Mixup per sample")
-parser.add_argument("--arch", type=str, default="tiny", choices=["tiny", "small", "base"], help="ViT backbone architecture (default: tiny)")
-parser.add_argument("--no-dino", action="store_true", help="Disable pretrained ViT backbone initialization")
-
-ARCH_CONFIGS = {
-    "tiny": {"tok_dim": 192, "num_head": 3, "num_layer": 12, "name": "DeiT ViT-Tiny"},
-    "small": {"tok_dim": 384, "num_head": 6, "num_layer": 12, "name": "DeiT ViT-Small"},
-    "base": {"tok_dim": 768, "num_head": 12, "num_layer": 12, "name": "DeiT ViT-Base"},
-}
 
 args = parser.parse_args()
 
@@ -142,7 +137,7 @@ def train():
     crit_mse = nn.MSELoss().to(device)
 
     # ============== Datasets & Distributed Samplers ==============
-    train_dataset = ACADDataset(
+    train_dataset = FSD50KDataset(
         root_dir=args.data_path,
         split="train",
         mock=args.mock,
@@ -151,8 +146,20 @@ def train():
         time_mask_param=args.time_mask,
         mixup_alpha=args.mixup_alpha,
         mixup_prob=args.mixup_prob,
+        return_labels=False,
+        noise_dir=args.noise_path,
+        min_snr=args.min_snr,
+        max_snr=args.max_snr,
     )
-    val_dataset = ACADDataset(root_dir=args.data_path, split="val", mock=args.mock)
+    val_dataset = FSD50KDataset(
+        root_dir=args.data_path,
+        split="val",
+        mock=args.mock,
+        return_labels=False,
+        noise_dir=args.noise_path,
+        min_snr=args.min_snr,
+        max_snr=args.max_snr,
+    )
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False) if is_distributed else None
 
@@ -174,43 +181,32 @@ def train():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
         worker_init_fn=seed_worker,
     ) if is_main else None
 
     # ============== Model & Architecture ==============
-    # AST Spectrogram input: (B, 1, 128, 500)
-    arch_cfg = ARCH_CONFIGS[args.arch]
-    model = Denoiser(
-        tok_dim=arch_cfg["tok_dim"],
-        c_in=1,
-        overlap=6,
-        patch_size=16,
-        size=(128, 500),
-        num_head=arch_cfg["num_head"],
-        num_layer=arch_cfg["num_layer"],
-        pretrained_dino=(not args.no_dino),
-    ).to(device)
-
-    # ============== Optimizer & Schedulers ==============
+    # AST Spectrogram input: (B, 1, 128, 1000)
+    model = Denoiser().to(device)
     raw_model = model.module if hasattr(model, "module") else model
-    encoder_params = [p for p in raw_model.encoder.parameters() if p.requires_grad]
-    decoder_params = [p for p in raw_model.decoder.parameters() if p.requires_grad]
 
-    optimizer = torch.optim.AdamW([
+     # ============== Optimizer & Schedulers ==============
+    encoder_params = [p for p in raw_model.encoder.parameters() if p.requires_grad]
+    decoder_params = [p for n, p in raw_model.named_parameters() if not n.startswith("encoder") and p.requires_grad]
+    param_groups = [
         {"params": encoder_params, "lr": args.encoder_lr, "weight_decay": args.weight_decay},
         {"params": decoder_params, "lr": args.decoder_lr, "weight_decay": args.weight_decay},
-    ])
+    ]
 
-    warmup_epochs = min(10, max(1, EPOCHS // 10))
-    linear_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, EPOCHS - warmup_epochs), eta_min=1e-6
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[linear_scheduler, cosine_scheduler], milestones=[warmup_epochs]
-    )
+    optimizer = torch.optim.AdamW(param_groups)
+
+    # AST schedule: keep initial LR for 5 epochs, then decay by 0.90 every epoch
+    def ast_lr_lambda(ep):
+        if ep < 5:
+            return 1.0
+        return 0.90 ** (ep - 4)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=ast_lr_lambda)
 
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
@@ -224,16 +220,18 @@ def train():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
 
     if is_main:
-        print(f"[Rank 0] AST Environmental Audio Denoiser Pretraining:")
+        print(f"[Rank 0] EfficientNet-B0 Audio Denoiser Pretraining :")
         print(f"  • Device:                 {device} (world size: {world_size})")
         print(f"  • Total samples:          {len(train_dataset)} train, {len(val_dataset)} val")
         print(f"  • Effective batch size:   {BATCH_SIZE * world_size * args.grad_accum_steps}")
-        print(f"  • Architecture:           ViT-{args.arch.capitalize()} ({arch_cfg['name']})")
-        print(f"  • Pretrained Backbone:    {f"{arch_cfg['name']} (pretrained)" if not args.no_dino else 'Random init'}")
+        print(f"  • Architecture:           EfficientNet-B0 + DenoisingDecoder")
+        print(f"  • Pretrained Backbone:    ImageNet Pretrained")
         print(f"  • Learning rates:         Encoder={args.encoder_lr}, Decoder={args.decoder_lr}")
+        if args.noise_path:
+            print(f"  • Real Noise Source:      {args.noise_path} (SNR: [{args.min_snr}, {args.max_snr}] dB)")
 
     # ============== Training and Validation Loop ==============
     for epoch in range(start_epoch, EPOCHS + 1):
