@@ -105,7 +105,7 @@ class Block(nn.Module):
 class DINOVisionTransformer(nn.Module):
     PRETRAINED_URLS = {
         192: "https://dl.fbaipublicfiles.com/deit/deit_tiny_distilled_patch16_224-b40b3cf7.pth",
-        384: "https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709e9.pth",
+        384: "https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709d9.pth",
         768: "https://dl.fbaipublicfiles.com/deit/deit_base_distilled_patch16_224-df68dfff.pth",
     }
 
