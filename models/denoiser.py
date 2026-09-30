@@ -8,7 +8,10 @@ import torch
 from torch import nn
 from models.encoder import ASTEncoder
 from models.decoder import DenoisingDecoder
-from torchinfo import summary
+try:
+    from torchinfo import summary
+except ImportError:
+    summary = None
 
 class Denoiser(nn.Module):
     def __init__(

@@ -3,7 +3,10 @@ import warnings
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchinfo import summary
+try:
+    from torchinfo import summary
+except ImportError:
+    summary = None
 
 
 class PatchEmbedder(nn.Module):

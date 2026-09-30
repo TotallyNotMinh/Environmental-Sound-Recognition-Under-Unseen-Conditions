@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 from models.encoder import ASTEncoder
 from models.resnet_encoder import ResNetEncoder
-from torchinfo import summary
+try:
+    from torchinfo import summary
+except ImportError:
+    summary = None
 
 class Classifer(nn.Module):
     """

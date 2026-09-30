@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 # Direct import as requested: user will implement/customize Classifer in models
 from models import Classifer
 from data.dataset import FSD50KDataset
+from data.sampler import DistributedWeightedSampler
 from metrics.classification import MultiLabelClassificationMetrics
 
 parser = argparse.ArgumentParser(description="Train AST Classifier on FSD50K multi-label sound events")
@@ -53,7 +54,7 @@ parser.add_argument("--encoder", type=str, default="ast", choices=["ast", "resne
 parser.add_argument("--arch", type=str, default="tiny", choices=["tiny", "small", "base"], help="ViT backbone architecture (default: tiny)")
 parser.add_argument("--no-dino", action="store_true", help="Disable pretrained ViT backbone initialization")
 parser.add_argument("--no-cls-dist", action="store_true", help="Disable CLS+DIST dual token pooling (fall back to mean pooling)")
-parser.add_argument("--lr-scheduler", type=str, default="ast_step", choices=["ast_step", "cosine"], help="LR scheduler: ast_step (decay 0.85 after epoch 5) or cosine")
+parser.add_argument("--lr-scheduler", type=str, default="ast_step", choices=["ast_step", "cosine"], help="LR scheduler: ast_step (decay 0.90 after epoch 5) or cosine")
 
 ARCH_CONFIGS = {
     "tiny": {"tok_dim": 192, "num_head": 3, "num_layer": 12, "name": "DeiT ViT-Tiny"},
@@ -141,7 +142,7 @@ def save_checkpoint(checkpoint_dir, checkpoint_name, epoch, model, optimizer, sc
 
 def load_resume_checkpoint(checkpoint_path, device, model, optimizer, scheduler, scaler):
     if checkpoint_path is None or not os.path.isfile(checkpoint_path):
-        return 0, 0.0, 0
+        return 1, 0.0, 0
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
@@ -157,7 +158,7 @@ def load_resume_checkpoint(checkpoint_path, device, model, optimizer, scheduler,
     if scaler is not None and "scaler_state_dict" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
-    start_epoch = checkpoint.get("epoch", -1) + 1
+    start_epoch = checkpoint.get("epoch", 0) + 1
     best_map = checkpoint.get("best_map", 0.0)
     epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
 
@@ -221,15 +222,25 @@ def train():
         normalize=True,
     )
 
-    if is_distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-    elif not args.no_class_balancing and not args.mock:
+    if not args.no_class_balancing and not args.mock:
         sample_weights = train_dataset.get_sample_weights()
-        train_sampler = torch.utils.data.WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True,
-        )
+        if is_distributed:
+            train_sampler = DistributedWeightedSampler(
+                dataset=train_dataset,
+                weights=sample_weights,
+                num_replicas=world_size,
+                rank=rank,
+                replacement=True,
+                seed=args.seed,
+            )
+        else:
+            train_sampler = torch.utils.data.WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+    elif is_distributed:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
     else:
         train_sampler = None
 
@@ -295,11 +306,11 @@ def train():
     optimizer = torch.optim.AdamW(param_groups)
 
     if args.lr_scheduler == "ast_step":
-        # AST schedule: keep initial LR for 5 epochs, then decay by 0.85 every epoch
+        # AST schedule: keep initial LR for 5 epochs, then decay by 0.90 every epoch
         def ast_lr_lambda(ep):
             if ep < 5:
                 return 1.0
-            return 0.85 ** (ep - 4)
+            return 0.90 ** (ep - 4)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=ast_lr_lambda)
     else:
@@ -338,10 +349,24 @@ def train():
         print(f"  • Architecture:           ViT-{args.arch.capitalize()} ({arch_cfg['name']})")
         print(f"  • Pretrained Backbone:    {backbone_desc}")
         print(f"  • Encoder Frozen:         {args.freeze_encoder}")
+        sampler_desc = (
+            "Class-Balanced (DistributedWeightedSampler)"
+            if (not args.no_class_balancing and not args.mock and is_distributed)
+            else (
+                "Class-Balanced (WeightedRandomSampler)"
+                if (not args.no_class_balancing and not args.mock)
+                else (
+                    "Standard DistributedSampler"
+                    if is_distributed
+                    else "Standard Uniform"
+                )
+            )
+        )
+        print(f"  • Sampling:               {sampler_desc}")
 
     # ============== Training and Validation Loop ==============
     for epoch in range(start_epoch, EPOCHS + 1):
-        if is_distributed and train_sampler is not None:
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         model.train(True)
