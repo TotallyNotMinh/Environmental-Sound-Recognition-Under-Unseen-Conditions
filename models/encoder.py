@@ -342,16 +342,11 @@ class ASTEncoder(nn.Module):
         return features
 
 class EfficientNetEncoder(nn.Module):
-    def  __init__(self, patch_size=16, overlap=10, tok_dim=192, size=(128, 1000)):
+    def  __init__(self):
         super().__init__()
         weights = EfficientNet_B0_Weights.DEFAULT
         backbone = efficientnet_b0(weights=weights)
         self.features = backbone.features
-        (H, W) = size
-
-        self.stride = patch_size - overlap
-        self.H_out = (H - patch_size) // self.stride + 1
-        self.W_out = (W - patch_size) // self.stride + 1
 
     def forward(self, x:torch.Tensor):
         if x.shape[1] == 1:
