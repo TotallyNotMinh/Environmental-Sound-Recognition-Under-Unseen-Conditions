@@ -16,20 +16,11 @@ except ImportError:
 class Denoiser(nn.Module):
     def __init__(
         self,
-        tok_dim=192,
-        c_in=1,
-        overlap=6,
-        patch_size=16,
-        size=(128, 500),
-        num_head=3,
-        num_layer=12,
-        use_dino=True,
-        pretrained_dino=True,
     ):
         super().__init__()
 
         self.encoder = EfficientNetEncoder()
-        self.decoder = DenoisingDecoder(tok_dim, patch_size, overlap, size=size)
+        self.decoder = DenoisingDecoder()
 
     def forward(self, x):
         features = self.encoder(x)
