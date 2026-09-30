@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import torch
 from torch import nn
-from models.encoder import ASTEncoder
+from models.encoder import EfficientNetEncoder
 from models.decoder import DenoisingDecoder
 try:
     from torchinfo import summary
@@ -28,29 +28,17 @@ class Denoiser(nn.Module):
     ):
         super().__init__()
 
-        self.encoder = ASTEncoder(
-            tok_dim=tok_dim,
-            c_in=c_in,
-            overlap=overlap,
-            patch_size=patch_size,
-            size=size,
-            num_head=num_head,
-            num_layer=num_layer,
-            use_dino=use_dino,
-            pretrained_dino=pretrained_dino,
-        )
+        self.encoder = EfficientNetEncoder()
         self.decoder = DenoisingDecoder(tok_dim, patch_size, overlap, size=size)
 
-    def forward(self, x, mask_ratio: float = 0.0):
-        features = self.encoder(x, mask_ratio=mask_ratio)
+    def forward(self, x):
+        features = self.encoder(x)
         output = self.decoder(features)
         return output
 
-Reconstructer = Denoiser
-
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = torch.rand([1, 1, 128, 500], device=device)
+    x = torch.rand([1, 1, 128, 1000], device=device)
     model = Denoiser().to(device=device)
     print(model(x).shape)
-    summary(model, [1, 1, 128, 500])
+    summary(model, [1, 1, 128, 1000])
