@@ -2,6 +2,10 @@
 */__pycache__
 /data/*
 
+# Local-only project instructions; not published to the remote.
+/CLAUDE.md
+docs
+
 !/data/dataset.py
 !/data/augment.py
 !/data/sampler.py
